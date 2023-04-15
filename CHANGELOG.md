@@ -5,7 +5,7 @@ NOTE: [`epaint`](crates/epaint/CHANGELOG.md), [`eframe`](crates/eframe/CHANGELOG
 
 
 ## Unreleased
-
+* Add `TableRow::col_sense` which does the same as `TableRow::col` but allows to specify a `Sense`. It allows for detecting clicks on rows ([Discussion #1519](https://github.com/emilk/egui/discussions/1519))
 
 ## 0.22.0 - 2023-05-23 - A plethora of small improvements
 ### ⭐ Added
