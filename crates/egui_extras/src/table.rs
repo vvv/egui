@@ -366,7 +366,7 @@ impl<'a> TableBuilder<'a> {
     pub fn header(self, height: f32, add_header_row: impl FnOnce(TableRow<'_, '_>)) -> Table<'a> {
         let available_width = self.available_width();
 
-        let Self {
+        let TableBuilder {
             ui,
             columns,
             striped,
@@ -399,6 +399,8 @@ impl<'a> TableBuilder<'a> {
                 col_index: 0,
                 striped: false,
                 height,
+                row_rect: None,
+                interaction: None,
             });
             layout.allocate_rect();
         });
@@ -581,6 +583,12 @@ impl<'a> Table<'a> {
 
             // Hide first-frame-jitters when auto-sizing.
             ui.add_visible_ui(!first_frame_auto_size_columns, |ui| {
+                let mut this_frame_interaction = None;
+                let mut prev_frame_interaction = ui.data_mut(|d| {
+                    let val = d.get_temp::<TableInteraction>(state_id);
+                    d.remove::<TableInteraction>(state_id);
+                    val
+                });
                 let layout = StripLayout::new(ui, CellDirection::Horizontal, cell_layout);
 
                 add_body_contents(TableBody {
@@ -594,7 +602,14 @@ impl<'a> Table<'a> {
                     end_y: avail_rect.bottom(),
                     scroll_to_row: scroll_to_row.map(|(r, _)| r),
                     scroll_to_y_range: &mut scroll_to_y_range,
+                    prev_frame_interaction: &mut prev_frame_interaction,
+                    this_frame_interaction: &mut this_frame_interaction,
                 });
+
+                if let Some(interaction) = this_frame_interaction {
+                    // Remember this frame's interaction for the next frame:
+                    ui.data_mut(|d| d.insert_temp(state_id, interaction));
+                }
 
                 if scroll_to_row.is_some() && scroll_to_y_range.is_none() {
                     // TableBody::row didn't find the right row, so scroll to the bottom:
@@ -712,6 +727,19 @@ impl<'a> Table<'a> {
     }
 }
 
+#[derive(Clone)]
+struct TableInteraction {
+    row_index: usize,
+    row_rect: Rect,
+    interaction: CellInteraction,
+}
+
+#[derive(Clone)]
+struct CellInteraction {
+    col_index: usize,
+    response: Response,
+}
+
 /// The body of a table.
 ///
 /// Is created by calling `body` on a [`Table`] (after adding a header row) or [`TableBuilder`] (without a header row).
@@ -727,6 +755,7 @@ pub struct TableBody<'a> {
     max_used_widths: &'a mut [f32],
 
     striped: bool,
+    /// How many rows have been added so far?
     row_nr: usize,
     start_y: f32,
     end_y: f32,
@@ -737,6 +766,12 @@ pub struct TableBody<'a> {
     /// If we find the correct row to scroll to,
     /// this is set to the y-range of the row.
     scroll_to_y_range: &'a mut Option<(f32, f32)>,
+
+    /// Previous frame's interaction. We use this data to highlight the background
+    /// of the corresponding row.
+    prev_frame_interaction: &'a mut Option<TableInteraction>,
+    /// This frame's interaction, if any.
+    this_frame_interaction: &'a mut Option<TableInteraction>,
 }
 
 impl<'a> TableBody<'a> {
@@ -772,6 +807,9 @@ impl<'a> TableBody<'a> {
     /// If you have many thousands of row it can be more performant to instead use [`Self::rows`] or [`Self::heterogeneous_rows`].
     pub fn row(&mut self, height: f32, add_row_content: impl FnOnce(TableRow<'a, '_>)) {
         let top_y = self.layout.cursor.y;
+        let mut row_rect = Rect::NAN;
+        let mut interaction = None;
+
         add_row_content(TableRow {
             layout: &mut self.layout,
             columns: self.columns,
@@ -780,8 +818,20 @@ impl<'a> TableBody<'a> {
             col_index: 0,
             striped: self.striped && self.row_nr % 2 == 0,
             height,
+            row_rect: Some(&mut row_rect),
+            interaction: Some(&mut interaction),
         });
         let bottom_y = self.layout.cursor.y;
+
+        if let Some(interaction) = interaction {
+            // It's impossible for two rows to be interacted with in the same frame.
+            egui::egui_assert!(self.this_frame_interaction.is_none());
+            *self.this_frame_interaction = Some(TableInteraction {
+                row_index: self.row_nr,
+                row_rect,
+                interaction,
+            });
+        }
 
         if Some(self.row_nr) == self.scroll_to_row {
             *self.scroll_to_y_range = Some((top_y, bottom_y));
@@ -845,7 +895,34 @@ impl<'a> TableBody<'a> {
             ((scroll_offset_y + max_height) / row_height_with_spacing).ceil() as usize + 1;
         let max_row = max_row.min(total_rows);
 
+        // Index of the row that had been interacted with a frame ago.
+        let row_to_highlight = self
+            .prev_frame_interaction
+            .as_ref()
+            .map(|interaction| interaction.row_index);
+
         for idx in min_row..max_row {
+            if row_to_highlight == Some(idx) {
+                // This row was interacted with a frame ago, so we need to highlight it.
+                let TableInteraction {
+                    row_index: _,
+                    row_rect,
+                    interaction,
+                } = self.prev_frame_interaction.take().unwrap();
+
+                let ui = &self.layout.ui;
+                if ui.is_rect_visible(row_rect) {
+                    let visuals = ui.style().interact(&interaction.response);
+                    let fill = visuals.weak_bg_fill;
+                    let stroke = visuals.bg_stroke;
+                    let rounding = visuals.rounding;
+                    ui.painter()
+                        .rect(row_rect.expand(visuals.expansion), rounding, fill, stroke);
+                }
+            }
+
+            let mut row_rect = Rect::NAN;
+            let mut interaction = None;
             add_row_content(
                 idx,
                 TableRow {
@@ -856,8 +933,20 @@ impl<'a> TableBody<'a> {
                     col_index: 0,
                     striped: self.striped && idx % 2 == 0,
                     height: row_height_sans_spacing,
+                    row_rect: Some(&mut row_rect),
+                    interaction: Some(&mut interaction),
                 },
             );
+
+            if let Some(interaction) = interaction {
+                // It's impossible for two rows to be interacted with in the same frame.
+                egui::egui_assert!(self.this_frame_interaction.is_none());
+                *self.this_frame_interaction = Some(TableInteraction {
+                    row_index: idx,
+                    row_rect,
+                    interaction,
+                });
+            }
         }
 
         if total_rows - max_row > 0 {
@@ -924,6 +1013,8 @@ impl<'a> TableBody<'a> {
                 // This row is visible:
                 self.add_buffer(old_cursor_y as f32); // skip all the invisible rows
 
+                let mut row_rect = Rect::NAN;
+                let mut interaction = None;
                 add_row_content(
                     row_index,
                     TableRow {
@@ -934,15 +1025,30 @@ impl<'a> TableBody<'a> {
                         col_index: 0,
                         striped: self.striped && row_index % 2 == 0,
                         height: row_height,
+                        row_rect: Some(&mut row_rect),
+                        interaction: Some(&mut interaction),
                     },
                 );
+
+                if let Some(interaction) = interaction {
+                    // It's impossible for two rows to be interacted with in the same frame.
+                    egui::egui_assert!(self.this_frame_interaction.is_none());
+                    *self.this_frame_interaction = Some(TableInteraction {
+                        row_index,
+                        row_rect,
+                        interaction,
+                    });
+                }
                 break;
             }
         }
 
-        // populate visible rows:
+        // Populate visible rows:
         for (row_index, row_height) in &mut enumerated_heights {
             let top_y = cursor_y;
+            let mut row_rect = Rect::NAN;
+            let mut interaction = None;
+
             add_row_content(
                 row_index,
                 TableRow {
@@ -953,9 +1059,21 @@ impl<'a> TableBody<'a> {
                     col_index: 0,
                     striped: self.striped && row_index % 2 == 0,
                     height: row_height,
+                    row_rect: Some(&mut row_rect),
+                    interaction: Some(&mut interaction),
                 },
             );
             cursor_y += (row_height + spacing.y) as f64;
+
+            if let Some(interaction) = interaction {
+                // It's impossible for two rows to be interacted with in the same frame.
+                egui::egui_assert!(self.this_frame_interaction.is_none());
+                *self.this_frame_interaction = Some(TableInteraction {
+                    row_index,
+                    row_rect,
+                    interaction,
+                });
+            }
 
             if Some(row_index) == self.scroll_to_row {
                 *self.scroll_to_y_range = Some((
@@ -999,8 +1117,8 @@ impl<'a> TableBody<'a> {
         }
     }
 
-    // Create a table row buffer of the given height to represent the non-visible portion of the
-    // table.
+    /// Create a table row buffer of the given height to represent the non-visible portion of the
+    /// table.
     fn add_buffer(&mut self, height: f32) {
         self.layout.skip_space(egui::vec2(0.0, height));
     }
@@ -1018,11 +1136,25 @@ pub struct TableRow<'a, 'b> {
     layout: &'b mut StripLayout<'a>,
     columns: &'b [Column],
     widths: &'b [f32],
-    /// grows during building with the maximum widths
+    /// Grows during building with the maximum widths.
     max_used_widths: &'b mut [f32],
     col_index: usize,
     striped: bool,
     height: f32,
+    /// This row's rectangle.
+    ///
+    /// The value is `None` if this `TableRow` was created by [`TableBuilder::header`] ---
+    /// we don't highlight the header row, so we don't need its rectangle.
+    row_rect: Option<&'b mut Rect>,
+    /// The value is `Some(Some(_))` iff a cell of this row has been interacted with
+    /// (hovered, clicked, or dragged).
+    ///
+    /// The value is `None` if this `TableRow` was created by [`TableBuilder::header`] ---
+    /// we don't highlight the header row, so there is no need to track interactions with it.
+    //
+    // NOTE: cells do not overlap, so at most one cell can be interacted with in the given
+    // frame.
+    interaction: Option<&'b mut Option<CellInteraction>>,
 }
 
 impl<'a, 'b> TableRow<'a, 'b> {
@@ -1055,6 +1187,23 @@ impl<'a, 'b> TableRow<'a, 'b> {
 
         if let Some(max_w) = self.max_used_widths.get_mut(col_index) {
             *max_w = max_w.max(used_rect.width());
+        }
+
+        match (self.row_rect.as_mut(), self.interaction.as_mut()) {
+            (None, None) => {} // header row
+            (Some(row_rect), Some(interaction)) => {
+                **row_rect = row_rect.union(response.rect);
+                if response.hovered() || response.clicked() || response.dragged() {
+                    // Cells do not overlap, so at most one can be interacted with
+                    // in the given frame.
+                    egui::egui_assert!(interaction.is_none());
+                    **interaction = Some(CellInteraction {
+                        col_index,
+                        response: response.clone(),
+                    });
+                }
+            }
+            _ => unreachable!(),
         }
 
         (used_rect, response)
