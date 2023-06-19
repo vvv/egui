@@ -755,8 +755,16 @@ pub struct TableBody<'a> {
     max_used_widths: &'a mut [f32],
 
     striped: bool,
+
     /// How many rows have been added so far?
+    //
+    // TODO(vvv): Update [`TableBody::rows`] and [`TableBody::heterogeneous_rows`]
+    // to use this field. Currently this field is only used by [`TableBody::row`].
+    // If `row` and `rows` (or `heterogeneous_rows`) are called with the same
+    // [`TableBody`], the striping bug described in
+    // <https://github.com/emilk/egui/issues/3076> may occur.
     row_nr: usize,
+
     start_y: f32,
     end_y: f32,
 
